@@ -18,17 +18,13 @@ from PIL import Image, ImageDraw
 from detector import detect_items_bbox
 
 # Import configuration
-from config import FLASH_MODEL_CONFIG, DETECT_BEST_BOX_CONFIG, DEFAULT_MONITOR_ID, DEFAULT_TARGET_ITEM
-
-# Configuration
-MODEL_ID = FLASH_MODEL_CONFIG["model_id"]
-TEMPERATURE = FLASH_MODEL_CONFIG["temperature"]
-THINKING_BUDGET = FLASH_MODEL_CONFIG["thinking_budget"]
+from config import DETECT_BEST_BOX_CONFIG, PRECISION_POINT_CONFIG, DEFAULT_MONITOR_ID, DEFAULT_TARGET_ITEM
 
 # Folders
 SCREENSHOTS_FOLDER = "screenshots"
 DETECTIONS_FOLDER = "detections"
 PIPELINE_FOLDER = os.path.join(DETECTIONS_FOLDER, "pipeline")
+LATEST_RESULTS_FOLDER = "latest_results"
 
 # Global client variable
 client = None
@@ -92,6 +88,7 @@ def detect_best_box_using_both_images(canvas_path: str,
                                     verbose: bool = True) -> Optional[int]:
     """
     Use both canvas and annotated screenshot to select the best matching box ID.
+    Returns "target" if the target item is not found in any box.
     
     Args:
         canvas_path: Path to the numbered canvas with cropped regions
@@ -101,7 +98,7 @@ def detect_best_box_using_both_images(canvas_path: str,
         verbose: Whether to print status messages
         
     Returns:
-        Box number (1-indexed) of the best match, or None if no match
+        Box number (1-indexed) of the best match, "target" if not found in boxes, or None if error
     """
     if verbose:
         print("\n=== Context-Aware Box Selection ===")
@@ -121,29 +118,38 @@ def detect_best_box_using_both_images(canvas_path: str,
 
 IMAGE 2 (Annotated Screenshot): The full screen with matching numbered bounding boxes (same numbers as Image 1) drawn on the original locations.
 
-YOUR TASK: Select the SINGLE BEST box number (1, 2, etc.) that matches "{target_item}". Reason step-by-step, considering both images for context.
+YOUR TASK: Select the SINGLE BEST box number (1, 2, etc.) that matches "{target_item}". This selected box will be used later to precisely locate the exact point of the target within it, so prioritize boxes that provide sufficient context and size for accurate sub-element detection. Reason step-by-step, considering both images for context.
 
 STEP-BY-STEP REASONING (think internally):
 1. Compare numbers across images: Box 1 in Image 1 corresponds to Box 1 in Image 2.
 2. For each numbered element in Image 1, examine its visual details (text, icons, shape).
 3. Cross-reference with Image 2: Check the screen position and surrounding context (e.g., is it in a menu bar? Near related elements?).
-4. Score matches: Prioritize exact visual+contextual fits for "{target_item}" (e.g., an "X" icon in a window title bar for "close button").
-5. If multiples match, choose the most prominent (e.g., largest, highest contrast, or most central).
-6. If none match well, return box_number null.
+4. Score matches: Prioritize exact visual+contextual fits for "{target_item}" (e.g., an "X" icon in a window title bar for "close button"). For sub-elements (e.g., "ear" in a portrait), prefer larger boxes that include the full containing object (e.g., the whole head or body) for better precision later, rather than tiny crops of just the sub-element.
+5. If multiples match, choose the most prominent and suitable for precise pointing (e.g., largest, highest contrast, most central, or with best surrounding context).
+6. If none match well in the boxes but the target exists elsewhere in the screenshot (Image 2), return point_at with what to search for.
+7. The Box MUST contain the target item, and NOT the box that is 'Nearest to the item'.
+
 
 RULES:
 - MUST use BOTH images: Visuals from Image 1, positions/context from Image 2.
 - Focus on interactive elements; ignore non-matches.
-- Handle ambiguities: E.g., for multiple "X" icons, pick the one best fitting "{target_item}" based on context.
+- Handle ambiguities: E.g., for multiple "X" icons, pick the one best fitting "{target_item}" based on context. For targets like "Putin's ear", select the largest box containing Putin's full body or head that includes the ear, to enable precise ear location within it later.
+- If the target exists in the full screenshot (Image 2) but not in any of the numbered boxes, return point_at instead of box_number.
+- CAVAS BOXES POSITIONS ARE NOT TO BE USED AS A REFERENCE FOR THE TARGET LOCATION.
 
 EXAMPLES:
-- Target "close button": If Box 2 shows an "X" in Image 1 and is in a window corner in Image 2, select 2.
 - Output: {{"box_number": 2, "confidence": 95, "reason": "Matches X icon in window title (exact visual and position)"}} 
+- Output: {{"box_number": 2, "confidence": 93, "reason": "Box 3 contains a small picture of an eye, however Box 2 contains the entire head, which includes the eye and provides better context for precise pointing"}} 
+- Output: {{"box_number": 4, "confidence": 98, "reason": "Box 4 shows Putin's full body including the ear, larger and clearer than Box 5 which only crops the head, enabling better precise ear detection later"}}
+- Output: {{"point_at": "The 2nd Icon located in the taskbar, with a red Lion face", "confidence": 85, "reason": "The brave icon is visible in the taskbar, but not show in the canvas"}}
+- Output: {{"box_number": null, "confidence": 0, "reason": "Target not found anywhere in the screenshot"}}
 
 OUTPUT FORMAT (exact JSON object, no extra text):
-{{"box_number": <integer or null>, "confidence": <70-100>, "reason": "<brief explanation>"}}
+{{"box_number": <integer or null>, "confidence": <70-100>, "reason": "<detailed reasoning explanation>"}} OR
+{{"point_at": "<detailed description of what to search for>", "confidence": <70-100>, "reason": "<brief explanation>"}}
 
-Return box_number null if no good match."""    
+Return box_number null if target doesn't exist anywhere."""
+    
     generation_config = types.GenerateContentConfig(
         temperature=DETECT_BEST_BOX_CONFIG["temperature"],
         response_mime_type="application/json",
@@ -180,9 +186,12 @@ Return box_number null if no good match."""
         box_number = result.get('box_number')
         if box_number and box_number > 0:
             return box_number
+        elif result.get('point_at'):
+            # Store the point_at value to be used by fullscreen detection
+            return {"type": "target", "point_at": result.get('point_at')}
         else:
             if verbose:
-                print("  No valid box number returned")
+                print("  No valid box number returned and no target found")
             return None
         
     except Exception as e:
@@ -191,101 +200,151 @@ Return box_number null if no good match."""
         return None
 
 
-def detect_center_points_from_bbox_image(image_path: str, 
-                                       bounding_boxes: List[Dict],
-                                       target_item: str,
-                                       verbose: bool = True) -> Optional[List[Dict]]:
+def detect_precise_point_in_crop(bbox: Dict,
+                                target_item: str,
+                                full_screenshot_path: str,
+                                verbose: bool = True) -> Optional[Dict]:
     """
-    Detect center points of bounding boxes in the cropped images canvas.
-    With better prompts and validation.
+    Extract crop from bbox and detect precise point for sub-element targets.
+    
+    Args:
+        bbox: Selected bounding box with xmin, ymin, xmax, ymax
+        target_item: What to find precisely (e.g., "Putin's ear")
+        full_screenshot_path: Path to original screenshot
+        verbose: Whether to print status messages
+        
+    Returns:
+        Dict with normalized point coordinates or None if failed
     """
     if verbose:
-        print("\n=== Point Detection Stage ===")
-        print(f"Processing image: {image_path}")
+        print("\n=== Precision Point Detection ===")
+        print(f"Extracting crop for precise detection of: {target_item}")
     
     try:
-        img = Image.open(image_path)
+        # Load the full screenshot
+        full_img = Image.open(full_screenshot_path)
+        
+        # Extract the crop using bbox coordinates
+        crop = full_img.crop((
+            bbox['xmin'], 
+            bbox['ymin'], 
+            bbox['xmax'], 
+            bbox['ymax']
+        ))
+        
         if verbose:
-            print(f"Image size: {img.size[0]}x{img.size[1]}")
-    except Exception as e:
+            print(f"Cropped region: {crop.size[0]}x{crop.size[1]} pixels")
+        
+        # Save the cropped image for debugging/visualization
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            crop_filename = f"precision_crop_{timestamp}.png"
+            crop_path = os.path.join(LATEST_RESULTS_FOLDER, crop_filename)
+            os.makedirs(LATEST_RESULTS_FOLDER, exist_ok=True)
+            crop.save(crop_path)
+            if verbose:
+                print(f"Saved cropped region: {crop_path}")
+        except Exception as e:
+            if verbose:
+                print(f"Warning: Could not save crop: {e}")
+        
+        # Create precision detection prompt
+        prompt = f"""point at the target item: '{target_item}' in the image
+
+OUTPUT FORMAT (exact JSON, no extra text):
+{{"point": [x, y], "confidence": <70-100>, "description": "<what you found>"}}
+
+Where:
+- point: [x, y] normalized 0-1000 
+- confidence: How certain you are this is the correct {target_item}
+- description: Brief description of what you're pointing at
+
+Return null if {target_item} is not clearly visible in the image."""
+
+        generation_config = types.GenerateContentConfig(
+            temperature=PRECISION_POINT_CONFIG["temperature"],
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_budget=PRECISION_POINT_CONFIG["thinking_budget"])
+        )
+        
         if verbose:
-            print(f"Error loading image: {e}")
-        return None
-    
-    # Prompt with better instructions
-    prompt = f"""You are analyzing a canvas grid of cropped UI elements, each in a black-bordered box.
-
-YOUR TASK: Identify the SINGLE BEST cropped element matching "{target_item}", then output its geometric center point (inside the border). Reason step-by-step.
-
-STEP-BY-STEP REASONING (think internally):
-1. Scan the grid: Each black-bordered crop shows a UI element.
-2. Match visuals to "{target_item}" (e.g., text, icons, shape).
-3. Select the best one: Prioritize clear, full-visibility matches.
-4. Calculate center: Midway point of the content (not border; aim for clickable area).
-5. If no match, return empty array.
-
-RULES:
-- Only one output: The strongest match.
-- Ignore borders: Point to element center (e.g., middle of an icon).
-- Context: Consider UI norms (e.g., button centers are clickable).
-
-EXAMPLES:
-- For "close button" (X icon): {{"point": [500, 500], "label": "X close icon center"}}
-- For "save icon": {{"point": [300, 400], "label": "Floppy disk save icon center"}}
-
-OUTPUT FORMAT (exact JSON array, no extra text):
-[{{"point": [y, x], "label": "<short description>"}}]
-
-- point: [y, x] normalized 0-1000.
-- Return [] if no match."""
-    
-    generation_config = types.GenerateContentConfig(
-        temperature=TEMPERATURE,
-        response_mime_type="application/json",
-        thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
-    )
-    
-    if verbose:
-        print("Detecting center points with Gemini...")
-    
-    try:
+            print("Analyzing crop for precise point detection...")
+            print(f"Using model: {PRECISION_POINT_CONFIG['model_id']}")
+        
         response = client.models.generate_content(
-            model=MODEL_ID,
-            contents=[img, prompt],
+            model=PRECISION_POINT_CONFIG["model_id"],
+            contents=[crop, prompt],
             config=generation_config
         )
         
-        try:
-            parsed_points = json.loads(response.text)
-        except json.JSONDecodeError:
-            json_str = response.text.strip()
-            if "```" in json_str:
-                import re
-                fence_regex = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
-                match = re.search(fence_regex, json_str, re.DOTALL)
-                if match:
-                    json_str = match.group(1).strip()
-            parsed_points = json.loads(json_str)
+        result = json.loads(response.text)
         
-        if verbose:
-            print(f"Detected {len(parsed_points)} center points")
-        
-        # Validate points are within image bounds
-        validated_points = []
-        for point in parsed_points:
-            if 'point' in point:
-                y, x = point['point']
-                if 0 <= y <= 1000 and 0 <= x <= 1000:
-                    validated_points.append(point)
-                elif verbose:
-                    print(f"Warning: Point ({y}, {x}) out of bounds, skipping")
-        
-        return validated_points
-        
+        if result and result.get('point'):
+            confidence = result.get('confidence', 0)
+            
+            # Check if confidence meets minimum threshold
+            if confidence < PRECISION_POINT_CONFIG.get('min_confidence', 80):
+                if verbose:
+                    print(f"Precision confidence {confidence}% below threshold {PRECISION_POINT_CONFIG['min_confidence']}%")
+                return None
+            
+            if verbose:
+                print(f"Precise point found: {result['description']}")
+                print(f"Confidence: {confidence}%")
+                print(f"Normalized coordinates: ({result['point'][0]}, {result['point'][1]})")
+            return result
+        else:
+            if verbose:
+                print("No precise point detected in crop")
+            return None
+            
     except Exception as e:
         if verbose:
-            print(f"Error during point detection: {e}")
+            print(f"Error during precision detection: {e}")
         return None
+
+
+def map_crop_point_to_screen(crop_point: List[int],
+                            bbox: Dict,
+                            normalized: bool = True,
+                            verbose: bool = False) -> List[int]:
+    """
+    Map a point from crop coordinates to screen coordinates.
+    
+    Args:
+        crop_point: [x, y] point in crop coordinates
+        bbox: Bounding box with screen coordinates
+        normalized: Whether crop_point is normalized (0-1000) or pixel coordinates
+        
+    Returns:
+        [x, y] in screen coordinates
+    """
+    y_crop, x_crop = crop_point
+    
+    # Convert from normalized to pixel coordinates if needed
+    if normalized:
+        crop_width = bbox['xmax'] - bbox['xmin']
+        crop_height = bbox['ymax'] - bbox['ymin']
+        x_pixel = (x_crop / 1000.0) * crop_width
+        y_pixel = (y_crop / 1000.0) * crop_height
+    else:
+        x_pixel = x_crop
+        y_pixel = y_crop
+    
+    # Add bbox offset to get screen coordinates
+    screen_x = int(bbox['xmin'] + x_pixel)
+    screen_y = int(bbox['ymin'] + y_pixel)
+    
+    # Debug logging
+    if verbose:
+        print(f"\nDEBUG: Mapping crop point to screen:")
+        print(f"  Crop point (normalized): {crop_point}")
+        print(f"  Crop point (pixels): ({x_pixel:.1f}, {y_pixel:.1f})")
+        print(f"  BBox: xmin={bbox['xmin']}, ymin={bbox['ymin']}, xmax={bbox['xmax']}, ymax={bbox['ymax']}")
+        print(f"  BBox size: {crop_width}x{crop_height}")
+        print(f"  Screen point: ({screen_x}, {screen_y})")
+    
+    return [screen_x, screen_y]
 
 
 def map_canvas_points_to_screen(points: List[Dict],
@@ -533,52 +592,22 @@ def select_best_detection(bounding_boxes: List[Dict],
                          target_item: str) -> Dict:
     """
     Select the best detection from multiple candidates.
-    Uses confidence scores and center point alignment.
+    Uses confidence scores to select the best bounding box.
+    
+    Note: center_points parameter is kept for compatibility but is no longer used.
     """
     if not bounding_boxes:
         return {'bbox': None, 'point': None}
     
-    if not center_points:
-        # Return highest confidence bbox
-        best_bbox = max(bounding_boxes, 
-                       key=lambda x: int(x.get('confidence', '0')))
-        return {'bbox': best_bbox, 'point': None}
-    
-    # If we have center points, find the bbox that contains it
-    best_point = center_points[0]  # Already filtered to best match
-    y, x = best_point['point']
-    
-    # Find bbox that contains this point
-    containing_bbox = None
-    for bbox in bounding_boxes:
-        if (bbox['xmin'] <= x <= bbox['xmax'] and 
-            bbox['ymin'] <= y <= bbox['ymax']):
-            containing_bbox = bbox
-            break
-    
-    if containing_bbox:
-        return {'bbox': containing_bbox, 'point': best_point}
-    
-    # If no bbox contains the point, return closest bbox
-    min_dist = float('inf')
-    closest_bbox = bounding_boxes[0]
-    
-    for bbox in bounding_boxes:
-        # Calculate distance from point to bbox center
-        bbox_cx = (bbox['xmin'] + bbox['xmax']) / 2
-        bbox_cy = (bbox['ymin'] + bbox['ymax']) / 2
-        dist = ((x - bbox_cx) ** 2 + (y - bbox_cy) ** 2) ** 0.5
-        
-        if dist < min_dist:
-            min_dist = dist
-            closest_bbox = bbox
-    
-    return {'bbox': closest_bbox, 'point': best_point}
+    # Return highest confidence bbox
+    best_bbox = max(bounding_boxes, 
+                   key=lambda x: int(x.get('confidence', '0')))
+    return {'bbox': best_bbox, 'point': None}
 
 
 def detect_ui_element(target_item: str,
                      monitor_id: int = DEFAULT_MONITOR_ID,
-                     mode: str = "bbox",
+                     mode: str = "point",
                      verbose: bool = True,
                      use_overlap: bool = True,
                      overlap_percentage: float = 0.25,
@@ -615,7 +644,6 @@ def detect_ui_element(target_item: str,
         'bbox': None,
         'center_point': None,
         'all_bounding_boxes': [],
-        'all_center_points': [],
         'confidence': 0,
         'method': None,
         'error': None
@@ -656,7 +684,7 @@ def detect_ui_element(target_item: str,
         
         # Stage 1: Bounding box detection
         bbox_result = detect_items_bbox(
-            items=target_item,
+            target=target_item,
             monitor_id=monitor_id,
             verbose=verbose,
             use_overlap=use_overlap,
@@ -700,45 +728,73 @@ def detect_ui_element(target_item: str,
         
         # Get the selected bbox based on box number
         best_bbox = None
-        if best_box_number:
+        if best_box_number and isinstance(best_box_number, int):
             # Box numbers are 1-indexed
             if 0 < best_box_number <= len(result['all_bounding_boxes']):
                 best_bbox = result['all_bounding_boxes'][best_box_number - 1]
                 result['selected_box_number'] = best_box_number
+        elif best_box_number and isinstance(best_box_number, dict) and best_box_number.get('type') == 'target':
+            # Target found in fullscreen but not in detected boxes
+            # Use fullscreen detection
+            if verbose:
+                print("\nTarget exists in fullscreen but not in detected boxes.")
+                print("Using direct fullscreen detection...")
+            
+            fullscreen_result = detect_target_in_fullscreen(
+                best_box_number.get('point_at'),
+                full_screenshot_path,
+                verbose
+            )
+            
+            if fullscreen_result:
+                result['center_point'] = fullscreen_result['point']
+                result['confidence'] = fullscreen_result['confidence'] / 100.0
+                result['status'] = 'success'
+                result['method'] = 'fullscreen_direct'
+                result['precision_mode'] = True
+                result['precision_confidence'] = fullscreen_result['confidence']
+                result['precision_description'] = fullscreen_result['description']
+                
+                # Create simple visualization with final detection
+                if save_visualization and result['status'] == 'success':
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    viz_filename = f"detection_{timestamp}.png"
+                    
+                    viz_path = create_simple_visualization(
+                        bbox=None,
+                        center_point=result['center_point'],
+                        output_filename=viz_filename,
+                        verbose=verbose
+                    )
+                    
+                    if viz_path:
+                        result['visualization_path'] = viz_path
+                
+                # Save to latest_results
+                if result['status'] == 'success':
+                    os.makedirs(LATEST_RESULTS_FOLDER, exist_ok=True)
+                    
+                    if 'visualization_path' in result and os.path.exists(result['visualization_path']):
+                        latest_result_path = os.path.join(LATEST_RESULTS_FOLDER, "latest_result.png")
+                        try:
+                            shutil.copy2(result['visualization_path'], latest_result_path)
+                            if verbose:
+                                print(f"\nLatest result image saved as: {latest_result_path}")
+                        except Exception as e:
+                            if verbose:
+                                print(f"Error saving latest result: {e}")
+                
+                return result
         
         # Initialize best dict
         best = None
         
         # If context-aware selection didn't work, fall back to original method
         if not best_bbox:
-            if mode in ["point", "bbox_and_point"] and canvas_path and os.path.exists(canvas_path):
-                # Find the corresponding coordinates file
-                canvas_filename = os.path.basename(canvas_path)
-                timestamp = canvas_filename.replace('cropped_canvas_', '').replace('.png', '')
-                coords_path = os.path.join(DETECTIONS_FOLDER, "cropped", f"cropped_coords_{timestamp}.json")
-                
-                if os.path.exists(coords_path):
-                    detected_points = detect_center_points_from_bbox_image(
-                        canvas_path, 
-                        result['all_bounding_boxes'],
-                        target_item,
-                        verbose
-                    )
-                    
-                    if detected_points:
-                        mapped_points = map_canvas_points_to_screen(
-                            detected_points,
-                            coords_path,
-                            screen_resolution,
-                            verbose
-                        )
-                        
-                        result['all_center_points'] = mapped_points
-            
             # Select best detection using original method (for any mode)
             best = select_best_detection(
                 result['all_bounding_boxes'],
-                result['all_center_points'],
+                [],  # No center points after removal of detection function
                 target_item
             )
             best_bbox = best.get('bbox')
@@ -757,21 +813,49 @@ def detect_ui_element(target_item: str,
             result['confidence'] = int(best_bbox.get('confidence', '0')) / 100.0
             result['status'] = 'success'
             
-            # Always calculate center point from the bounding box
-            # This ensures the dot is in the center of the detected box
-            bbox_center_x = best_bbox['xmin'] + (best_bbox['xmax'] - best_bbox['xmin']) // 2
-            bbox_center_y = best_bbox['ymin'] + (best_bbox['ymax'] - best_bbox['ymin']) // 2
-            result['center_point'] = [bbox_center_x, bbox_center_y]
-        elif best and best.get('point'):
-            # Only use detected point if no bbox was found
-            y, x = best['point']['point']
-            result['center_point'] = [x, y]
+            # Check if we need precision point detection
+            # This is useful when the target is a sub-element (e.g., "ear" within a face)
+            use_precision = mode in ["point", "bbox_and_point"]
+            
+            if use_precision and best_bbox:
+                # Try precision detection on the selected crop
+                full_screenshot_path = os.path.join(SCREENSHOTS_FOLDER, "screenshot_full.png")
+                precision_result = detect_precise_point_in_crop(
+                    best_bbox,
+                    target_item,
+                    full_screenshot_path,
+                    verbose
+                )
+                
+                if precision_result and precision_result.get('point'):
+                    # Map the precise point to screen coordinates
+                    precise_screen_point = map_crop_point_to_screen(
+                        precision_result['point'],
+                        best_bbox,
+                        normalized=True,
+                        verbose=verbose
+                    )
+                    result['center_point'] = precise_screen_point
+                    result['precision_mode'] = True
+                    result['precision_confidence'] = precision_result.get('confidence', 0)
+                    result['precision_description'] = precision_result.get('description', '')
+                    
+                    if verbose:
+                        print(f"\nPrecision point mapped to screen: ({precise_screen_point[0]}, {precise_screen_point[1]})")
+            
+            # Fall back to bbox center if precision detection wasn't used or failed
+            if not result.get('center_point'):
+                # Calculate center point from the bounding box
+                bbox_center_x = best_bbox['xmin'] + (best_bbox['xmax'] - best_bbox['xmin']) // 2
+                bbox_center_y = best_bbox['ymin'] + (best_bbox['ymax'] - best_bbox['ymin']) // 2
+                result['center_point'] = [bbox_center_x, bbox_center_y]
+                result['precision_mode'] = False
         
         # Create visualization if requested
         if verbose and mode == "bbox_and_point":
-            combined_viz = visualize_combined_results(
+            visualize_combined_results(
                 result['all_bounding_boxes'],
-                result['all_center_points'],
+                [],  # No center points after removal of detection function
                 screen_resolution,
                 verbose=verbose
             )
@@ -791,15 +875,48 @@ def detect_ui_element(target_item: str,
             
             if viz_path:
                 result['visualization_path'] = viz_path
-                
-                # Also save with a predictable name for easy access
-                latest_viz_path = os.path.join(DETECTIONS_FOLDER, "latest_detection.png")
+        
+        # Save all latest images to latest_results folder
+        if result['status'] == 'success':
+            # Create latest_results folder
+            os.makedirs(LATEST_RESULTS_FOLDER, exist_ok=True)
+            
+            # Save latest result/detection image
+            if 'visualization_path' in result and os.path.exists(result['visualization_path']):
+                latest_result_path = os.path.join(LATEST_RESULTS_FOLDER, "latest_result.png")
                 try:
-                    shutil.copy2(viz_path, latest_viz_path)
+                    shutil.copy2(result['visualization_path'], latest_result_path)
                     if verbose:
-                        print(f"Latest detection also saved as: {latest_viz_path}")
-                except:
-                    pass
+                        print(f"\nLatest result image saved as: {latest_result_path}")
+                except Exception as e:
+                    if verbose:
+                        print(f"Error saving latest result: {e}")
+            
+            # Save latest canvas and annotated images
+            if 'bbox_result' in result:
+                bbox_result = result['bbox_result']
+                
+                # Save latest canvas image
+                if bbox_result.get('cropped_images_canvas') and os.path.exists(bbox_result['cropped_images_canvas']):
+                    latest_canvas_path = os.path.join(LATEST_RESULTS_FOLDER, "latest_canvas.png")
+                    try:
+                        shutil.copy2(bbox_result['cropped_images_canvas'], latest_canvas_path)
+                        if verbose:
+                            print(f"Latest canvas image saved as: {latest_canvas_path}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error saving latest canvas: {e}")
+                
+                # Save latest annotated image
+                if bbox_result.get('numbered_annotated_image') and os.path.exists(bbox_result['numbered_annotated_image']):
+                    latest_annotated_path = os.path.join(LATEST_RESULTS_FOLDER, "latest_annotated.png")
+                    try:
+                        shutil.copy2(bbox_result['numbered_annotated_image'], latest_annotated_path)
+                        if verbose:
+                            print(f"Latest annotated image saved as: {latest_annotated_path}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error saving latest annotated: {e}")
         
         # Save pipeline results
         save_pipeline_results(result, verbose)
@@ -812,6 +929,102 @@ def detect_ui_element(target_item: str,
             traceback.print_exc()
     
     return result
+
+
+def detect_target_in_fullscreen(target_item: str,
+                               screenshot_path: str,
+                               verbose: bool = True) -> Optional[Dict]:
+    """
+    Detect target directly in full screenshot using Gemini.
+    
+    Args:
+        target_item: What to find
+        screenshot_path: Path to full screenshot
+        verbose: Whether to print status messages
+        
+    Returns:
+        Dict with point coordinates or None if failed
+    """
+    if verbose:
+        print("\n=== Fullscreen Target Detection ===")
+        print(f"Target: {target_item}")
+    
+    try:
+        img = Image.open(screenshot_path)
+        img_width, img_height = img.size
+        
+        if verbose:
+            print(f"Screenshot size: {img_width}x{img_height}")
+    except Exception as e:
+        if verbose:
+            print(f"Error loading screenshot: {e}")
+        return None
+    
+    prompt = f"""Point to: {target_item}
+
+The answer should follow the json format:
+{{"point": [x, y], "confidence": <70-100>, "description": "<what you found>"}}
+
+Where:
+- point: [x, y] format normalized to 0-1000.
+- confidence: How certain you are this is the correct {target_item}
+- description: Brief description of what you found
+
+Return null if {target_item} is not found."""
+
+    generation_config = types.GenerateContentConfig(
+        temperature=PRECISION_POINT_CONFIG["temperature"],
+        response_mime_type="application/json",
+        thinking_config=types.ThinkingConfig(thinking_budget=PRECISION_POINT_CONFIG["thinking_budget"])
+    )
+    
+    if verbose:
+        print("Analyzing full screenshot with Gemini...")
+    
+    try:
+        response = client.models.generate_content(
+            model=PRECISION_POINT_CONFIG["model_id"],
+            contents=[img, prompt],
+            config=generation_config
+        )
+        
+        result = json.loads(response.text)
+        
+        if result and result.get('point'):
+            confidence = result.get('confidence', 0)
+            
+            if confidence < PRECISION_POINT_CONFIG.get('min_confidence', 80):
+                if verbose:
+                    print(f"Confidence {confidence}% below threshold")
+                return None
+            
+            # Convert normalized coordinates to screen coordinates
+            x_norm, y_norm = result['point']
+            screen_x = int((x_norm / 1000.0) * img_width)
+            screen_y = int((y_norm / 1000.0) * img_height)
+            
+            if verbose:
+                print(f"\nTarget found in fullscreen:")
+                print(f"  Description: {result['description']}")
+                print(f"  Confidence: {confidence}%")
+                print(f"  Screen coordinates: ({screen_x}, {screen_y})")
+            
+            return {
+                'point': [screen_x, screen_y],
+                'point_normalized': result['point'],
+                'confidence': confidence,
+                'description': result['description'],
+                'method': 'fullscreen_direct'
+            }
+        else:
+            if verbose:
+                print("No target found in fullscreen")
+            return None
+            
+    except Exception as e:
+        if verbose:
+            print(f"Error during fullscreen detection: {e}")
+        return None
 
 
 def save_pipeline_results(result: Dict, verbose: bool = True):
@@ -864,10 +1077,17 @@ def print_results_summary(result: Dict):
     if result['center_point']:
         x, y = result['center_point']
         print(f"\nCenter Point: ({x}, {y})")
+        
+        # Show precision mode info if available
+        if result.get('precision_mode'):
+            print(f"  Precision Mode: Enabled")
+            print(f"  Precision Target: {result.get('precision_description', 'N/A')}")
+            print(f"  Precision Confidence: {result.get('precision_confidence', 0)}%")
+        else:
+            print(f"  Precision Mode: Disabled (using bbox center)")
     
     print(f"\nTotal Detections:")
     print(f"  Bounding boxes: {len(result.get('all_bounding_boxes', []))}")
-    print(f"  Center points: {len(result.get('all_center_points', []))}")
 
 
 def main():
@@ -892,7 +1112,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["bbox", "point", "bbox_and_point"],
-        default="bbox",
+        default="bbox_and_point",
         help="Detection mode (default: bbox)"
     )
     parser.add_argument(

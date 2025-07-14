@@ -27,19 +27,22 @@ except:
         pass
 
 # --- Configuration ---
+# Import configuration from config.py
+from config import DETECTOR_MODEL_CONFIG
+
 # Gemini Client Initialization
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 # Model Configuration
-MODEL_ID = "gemini-2.5-flash"
-TEMPERATURE = 0.0
-THINKING_BUDGET = 0
+MODEL_ID = DETECTOR_MODEL_CONFIG["model_id"]
+TEMPERATURE = DETECTOR_MODEL_CONFIG["temperature"]
+THINKING_BUDGET = DETECTOR_MODEL_CONFIG["thinking_budget"]
 
 # Detection Configuration
-MIN_CONFIDENCE = 70  # Minimum confidence threshold
-MAX_DETECTIONS_PER_OCTANT = 5  # Increased from 3
-DEFAULT_OVERLAP_PERCENTAGE = 0.25  # Increased from 0.20
-NMS_IOU_THRESHOLD = 0.5  # For Non-Maximum Suppression
+MIN_CONFIDENCE = DETECTOR_MODEL_CONFIG["min_confidence"]
+MAX_DETECTIONS_PER_OCTANT = DETECTOR_MODEL_CONFIG["max_detections_per_octant"]
+DEFAULT_OVERLAP_PERCENTAGE = DETECTOR_MODEL_CONFIG["default_overlap_percentage"]
+NMS_IOU_THRESHOLD = DETECTOR_MODEL_CONFIG["nms_iou_threshold"]
 
 # Folder configuration
 SCREENSHOTS_FOLDER = "screenshots"
@@ -245,57 +248,68 @@ def merge_overlapping_detections(detections: List[Dict],
     return merged
 
 
-def generate_context_aware_prompt(items: str) -> str:
+def generate_context_aware_prompt(target: str) -> str:
     """
     Generate a context-aware prompt for better detection.
     
     Args:
-        items: What to detect
+        target: What to detect
         
     Returns:
         Prompt string
     """
     base_prompt = f"""You are an expert UI element detector analyzing a zoomed-in screenshot section.
 
-YOUR TASK: Detect {items} in this image.
+STEP-BY-STEP REASONING (think internally, do not include in output):
+1. Interpret the query "{target}": Generate possible synonyms, visual descriptions, or related terms. 
+   - For example, "Brave icon", it might refer to the Brave web browser icon (lion logo), a browser shortcut, or an app launcher icon for Brave.
+   - "battery icon", it might mean a battery status symbol in the taskbar, power indicator, or laptop charge icon.
+   -"browser tab", it might include all visible tabs in a browser window, such as active/inactive tabs with titles or close buttons.
+2. Consider multiples: If the target implies similar elements (e.g., all browser tabs), plan to detect all relevant instances.
+3. Consider context: If the target is a small detail within a larger element (e.g., an ear in a photo), plan to detect both as separate items.
+4. Focus on relevance: Ensure all detections directly match your interpretations; ignore unrelated elements.
+5. Use these interpretations to guide your detection below. Prioritize the most likely matches based on visual similarity, interactivity, and common UI patterns.
+
+YOUR TASK: Detect {target} in this image, using your interpreted descriptions from reasoning.
 
 DETECTION GUIDELINES:
-1. Look for UI elements that match: {items}
-2. Include elements that are at least 60% visible
-3. Focus on interactive elements (buttons, links, icons, menus)
-4. Prioritize elements that users can click or interact with
-5. Each element should have a clear, tight bounding box
-
+1. Detect ONLY elements that directly match or are highly relevant to your interpreted target. Do not include unrelated UI elements, even if they are prominent.
+2. If multiple similar elements match the target (e.g., all visible browser tabs for 'browser tab'), include them all, prioritizing the most confident/relevant ones up to the limit.
+3. Include elements that are at least 60% visible.
+4. Prioritize elements that users can click or interact with (buttons, links, icons, menus).
+5. Each element should have a clear, tight bounding box.
+6. **CONTEXTUAL DETECTION**: If the target is a small detail within a larger, distinct element (e.g., a face within an advertisement, an icon within a button), you MUST return **two separate detections**: one for the specific target and another for the larger containing element.
+7. For icons, consider recognizable logos, symbols, or shapes (e.g., a lion for Brave browser).
+8. 
 EXAMPLES OF WHAT TO DETECT:
-- Buttons with text labels or icons
-- Clickable links or hyperlinks  
-- Menu items and navigation elements
-- Toolbar icons and action buttons
-- Form controls (checkboxes, radio buttons, dropdowns)
-- Application icons or shortcuts
-- Tab headers and section titles (if interactive)
-- Window control buttons (close, minimize, maximize)
+- Interactive buttons, icons, and toolbar actions (e.g., save or print icons)
+- Clickable links, hyperlinks, menus, and navigation elements
+- Form controls (e.g., checkboxes, radio buttons, dropdowns)
+- Application icons/shortcuts (e.g., browser icons like Chrome globe or Brave lion) and window controls (e.g., close, minimize)
+- Tab headers and interactive section titles
+- All related instances if multiple match (e.g., all visible browser tabs for 'browser tab');
 
-EXAMPLES OF WHAT NOT TO DETECT:
-- Background images or decorative elements
-- Static text that isn't clickable
-- Window borders or frames
-- Shadows or visual effects
-- Partially visible elements (<60% shown)
+
 
 OUTPUT FORMAT:
 [{{"box_2d": [ymin, xmin, ymax, xmax], "label": "<precise description> (<confidence>%)"}}]
 
 Where:
 - box_2d: [ymin, xmin, ymax, xmax] normalized to 0-1000
-- label: Specific description + confidence (70-100%)
-- Include up to {MAX_DETECTIONS_PER_OCTANT} most relevant detections
+- label: Specific description of the target + confidence ({MIN_CONFIDENCE}-100%)
+- Include up to {MAX_DETECTIONS_PER_OCTANT} most relevant detections, with minimum of 2 detections.
 - Only include detections with confidence >= {MIN_CONFIDENCE}%
 
 EXAMPLE GOOD RESPONSES:
 [{{"box_2d": [100, 200, 150, 280], "label": "File menu button (92%)"}}]
 [{{"box_2d": [300, 400, 340, 480], "label": "Save document icon (88%)"}}, 
  {{"box_2d": [300, 500, 340, 580], "label": "Print icon (85%)"}}]
+# Example: Detecting all browser tabs for target "browser tab"
+[{{"box_2d": [100, 100, 150, 300], "label": "Browser tab titled 'Google' (95%)"}}, 
+ {{"box_2d": [100, 310, 150, 510], "label": "Browser tab titled 'YouTube' (92%)"}}]
+# Example: Detecting "Putin's ear" and also returning the ad it belongs to as a separate detection.
+[{{"box_2d": [526, 626, 547, 646], "label": "Putin's ear (95%)"}}, 
+ {{"box_2d": [444, 445, 675, 776], "label": "Whole image of ad with Putin (90%)"}}]
 
 RETURN [] if no matching elements found with sufficient confidence."""
 
@@ -304,7 +318,7 @@ RETURN [] if no matching elements found with sufficient confidence."""
 
 def process_single_octant_bbox(image_path: str, 
                              octant_id: int,
-                             items: str = "items", 
+                             target: str = "target", 
                              verbose: bool = True) -> List[Dict]:
     """
     Process a single octant image to detect bounding boxes.
@@ -312,11 +326,11 @@ def process_single_octant_bbox(image_path: str,
     Args:
         image_path: Path to the octant image
         octant_id: ID of the octant (0-7)
-        items: What to look for in the image
+        target: What to look for in the image
         verbose: Whether to print status messages
         
     Returns:
-        List of detected items with bounding boxes
+        List of detected targets with bounding boxes
     """
     try:
         img = Image.open(image_path)
@@ -328,8 +342,7 @@ def process_single_octant_bbox(image_path: str,
         return []
     
     # Generate context-aware prompt
-    prompt = generate_context_aware_prompt(items)
-    
+    prompt = generate_context_aware_prompt(target)
     generation_config = types.GenerateContentConfig(
         temperature=TEMPERATURE,
         response_mime_type="application/json",
@@ -343,16 +356,16 @@ def process_single_octant_bbox(image_path: str,
             config=generation_config
         )
         
-        detected_items = json.loads(response.text)
+        detected_targets = json.loads(response.text)
         
-        if verbose and detected_items:
-            print(f"    Found {len(detected_items)} items in octant {octant_id}")
+        if verbose and detected_targets:
+            print(f"    Found {len(detected_targets)} targets in octant {octant_id}")
         
         # Add octant ID to each detection
-        for item in detected_items:
+        for item in detected_targets:
             item['octant'] = octant_id
         
-        return detected_items
+        return detected_targets
         
     except Exception as e:
         if verbose:
@@ -361,7 +374,7 @@ def process_single_octant_bbox(image_path: str,
 
 
 
-def detect_items_bbox(items: str = "items",
+def detect_items_bbox(target: str = "target",
                      monitor_id: int = 2,
                      verbose: bool = True,
                      use_overlap: bool = True,
@@ -374,7 +387,7 @@ def detect_items_bbox(items: str = "items",
     Detection with overlapping octants and duplicate merging.
     
     Args:
-        items: What to look for
+        target: What to look for
         monitor_id: Monitor to capture
         verbose: Whether to print status messages
         use_overlap: Whether to use overlapping octants
@@ -397,7 +410,7 @@ def detect_items_bbox(items: str = "items",
     if verbose:
         print(f"\n{'='*60}")
         print(f"Octant Bounding Box Detection")
-        print(f"Target: {items}")
+        print(f"Target: {target}")
         print(f"Overlap: {overlap_percentage*100}%")
         print(f"Min Confidence: {MIN_CONFIDENCE}%")
         print(f"Max Detections/Octant: {MAX_DETECTIONS_PER_OCTANT}")
@@ -467,7 +480,7 @@ def detect_items_bbox(items: str = "items",
     
     with ThreadPoolExecutor(max_workers=8) as executor:
         future_to_octant = {
-            executor.submit(process_single_octant_bbox, octant_file, idx, items, verbose): idx
+            executor.submit(process_single_octant_bbox, octant_file, idx, target, verbose): idx
             for idx, octant_file in enumerate(octant_files)
         }
         
@@ -546,7 +559,7 @@ def detect_items_bbox(items: str = "items",
             print("\nNo detections in octants, trying full screen detection...")
         
         full_img_path = os.path.join(SCREENSHOTS_FOLDER, "screenshot_full.png")
-        full_detections = process_single_octant_bbox(full_img_path, -1, items, verbose)
+        full_detections = process_single_octant_bbox(full_img_path, -1, target, verbose)
         
         # Convert normalized coordinates to screen coordinates
         for detection in full_detections:
@@ -574,7 +587,7 @@ def detect_items_bbox(items: str = "items",
     # Save results
     results = {
         'timestamp': timestamp,
-        'target_items': items,
+        'target_items': target,
         'use_overlap': use_overlap,
         'overlap_percentage': overlap_percentage,
         'total_detections': len(final_detections),
@@ -592,7 +605,7 @@ def detect_items_bbox(items: str = "items",
     if verbose:
         print(f"\n{'='*60}")
         print(f"Detection Complete")
-        print(f"Total items found: {len(final_detections)}")
+        print(f"Total targets found: {len(final_detections)}")
         print(f"Results saved: {results_file}")
         print(f"{'='*60}")
     
@@ -690,7 +703,7 @@ def create_cropped_images_canvas(detections: List[Dict],
     canvas_width = (max_crop_width + padding) * min(len(detections), crops_per_row) + padding
     canvas_height = (max_crop_height + label_height_estimate + label_spacing + padding) * rows_needed + padding
     
-    canvas = Image.new('RGB', (canvas_width, canvas_height), 'white')
+    canvas = Image.new('RGB', (canvas_width, canvas_height), 'black')
     draw = ImageDraw.Draw(canvas)
     
     # Try to load fonts for number display
@@ -723,7 +736,7 @@ def create_cropped_images_canvas(detections: List[Dict],
             # Scale up small icons to minimum display size
             scale = min(min_display_size/crop_width, min_display_size/crop_height)
         else:
-            # For larger items, fit within max dimensions
+            # For larger targets, fit within max dimensions
             scale = min(max_crop_width/crop_width, max_crop_height/crop_height, 1.0)
         
         # Apply scaling if needed

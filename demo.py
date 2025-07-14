@@ -1,4 +1,10 @@
-from pipeline import get_icon_xy
+from pipeline import detect_ui_element
+import pyautogui
 
-coords = get_icon_xy("battery icon", monitor_id=1)
-print(coords)
+
+target = "cat with laptop in the background"
+
+result = detect_ui_element(target_item=target, monitor_id=1, mode="point", verbose=True)
+print(result['center_point'])
+
+pyautogui.moveTo(result['center_point'])

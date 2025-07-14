@@ -3,7 +3,7 @@ doc.md
 # Folders
 detections/
 screenshots/
-
+latest_results/
 # Python cache
 __pycache__/
 *.pyc
