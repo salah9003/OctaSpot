@@ -1,0 +1,11 @@
+doc.md
+
+# Folders
+detections/
+screenshots/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
